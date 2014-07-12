@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
+	"os"
 	"sync"
 	"time"
 
@@ -13,10 +16,14 @@ type State struct {
 	jobs map[string]*host.ActiveJob
 	mtx  sync.RWMutex
 
-	containers map[string]*host.ActiveJob              // docker container ID -> job
+	containers map[string]*host.ActiveJob              // container ID -> job
 	listeners  map[string]map[chan host.Event]struct{} // job id -> listener list (ID "all" gets all events)
 	listenMtx  sync.RWMutex
 	attachers  map[string]chan struct{}
+
+	stateFileMtx sync.Mutex
+	stateFile    *os.File
+	backend      Backend
 }
 
 func NewState() *State {
@@ -28,12 +35,62 @@ func NewState() *State {
 	}
 }
 
+func (s *State) Restore(file string, backend Backend) error {
+	s.stateFileMtx.Lock()
+	defer s.stateFileMtx.Unlock()
+	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return err
+	}
+	s.stateFile = f
+	s.backend = backend
+	d := json.NewDecoder(f)
+	if err := d.Decode(&s.jobs); err != nil {
+		if err == io.EOF {
+			err = nil
+		}
+		return err
+	}
+	for _, job := range s.jobs {
+		if job.ContainerID != "" {
+			s.containers[job.ContainerID] = job
+		}
+	}
+	return backend.RestoreState(s.jobs, d)
+}
+
+func (s *State) persist() {
+	s.stateFileMtx.Lock()
+	defer s.stateFileMtx.Unlock()
+	if _, err := s.stateFile.Seek(0, 0); err != nil {
+		// log error
+		return
+	}
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	enc := json.NewEncoder(s.stateFile)
+	if err := enc.Encode(s.jobs); err != nil {
+		// log error
+		return
+	}
+	if b, ok := s.backend.(StateSaver); ok {
+		if err := b.SaveState(enc); err != nil {
+			// log error
+			return
+		}
+	}
+	if err := s.stateFile.Sync(); err != nil {
+		// log error
+	}
+}
+
 func (s *State) AddJob(j *host.Job) {
 	s.mtx.Lock()
 	job := &host.ActiveJob{Job: j}
 	s.jobs[j.ID] = job
 	s.mtx.Unlock()
 	s.sendEvent(job, "create")
+	go s.persist()
 }
 
 func (s *State) GetJob(id string) *host.ActiveJob {
@@ -45,6 +102,13 @@ func (s *State) GetJob(id string) *host.ActiveJob {
 	}
 	jobCopy := *job
 	return &jobCopy
+}
+
+func (s *State) RemoveJob(id string) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	delete(s.jobs, id)
+	go s.persist()
 }
 
 func (s *State) Get() map[string]host.ActiveJob {
@@ -73,21 +137,38 @@ func (s *State) SetContainerID(jobID, containerID string) {
 	s.jobs[jobID].ContainerID = containerID
 	s.containers[containerID] = s.jobs[jobID]
 	s.mtx.Unlock()
+	go s.persist()
+}
+
+func (s *State) SetInternalIP(jobID, ip string) {
+	s.mtx.Lock()
+	s.jobs[jobID].InternalIP = ip
+	s.mtx.Unlock()
+	go s.persist()
+}
+
+func (s *State) SetManifestID(jobID, manifestID string) {
+	s.mtx.Lock()
+	s.jobs[jobID].ManifestID = manifestID
+	s.mtx.Unlock()
+	go s.persist()
 }
 
 func (s *State) SetStatusRunning(jobID string) {
 	s.mtx.Lock()
 
 	job, ok := s.jobs[jobID]
-	if !ok {
+	if !ok || job.Status != host.StatusStarting {
 		s.mtx.Unlock()
 		return
 	}
 
 	job.StartedAt = time.Now().UTC()
 	job.Status = host.StatusRunning
+
 	s.mtx.Unlock()
 	s.sendEvent(job, "start")
+	go s.persist()
 }
 
 func (s *State) SetStatusDone(containerID string, exitCode int) {
@@ -107,6 +188,7 @@ func (s *State) SetStatusDone(containerID string, exitCode int) {
 	}
 	s.mtx.Unlock()
 	s.sendEvent(job, "stop")
+	go s.persist()
 }
 
 func (s *State) SetStatusFailed(jobID string, err error) {
@@ -123,6 +205,7 @@ func (s *State) SetStatusFailed(jobID string, err error) {
 	job.Error = &errStr
 	s.mtx.Unlock()
 	s.sendEvent(job, "error")
+	go s.persist()
 }
 
 func (s *State) AddAttacher(jobID string, ch chan struct{}) *host.ActiveJob {
