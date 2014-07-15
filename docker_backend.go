@@ -54,7 +54,7 @@ type dockerClient interface {
 
 func (d *DockerBackend) Run(job *host.Job) error {
 	g := grohl.NewContext(grohl.Data{"backend": "docker", "fn": "run", "job.id": job.ID})
-	g.Log(grohl.Data{"at": "start", "job.artifact.url": job.Artifact.URL, "job.cmd": job.Config.Cmd})
+	g.Log(grohl.Data{"at": "start", "job.artifact.url": job.Artifact.URI, "job.cmd": job.Config.Cmd})
 
 	config := &docker.Config{
 		// Image:

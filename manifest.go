@@ -75,6 +75,7 @@ type manifestRunner struct {
 type manifestService struct {
 	ID         string            `json:"id"`
 	Image      string            `json:"image"`
+	ImageID    string            `json:"image_id"`
 	Entrypoint []string          `json:"entrypoint"`
 	Args       []string          `json:"args"`
 	Env        map[string]string `json:"env"`
@@ -183,12 +184,15 @@ func (m *manifestRunner) runManifest(r io.Reader) (map[string]*ManifestData, err
 		if service.Image == "" {
 			service.Image = "https://registry.hub.docker.com/flynn/" + service.ID
 		}
+		if service.ImageID != "" {
+			service.Image += "?id=" + service.ImageID
+		}
 
 		job := &host.Job{
 			ID: cluster.RandomJobID("flynn-" + service.ID + "-"),
 			Artifact: host.Artifact{
 				Type: "docker",
-				URL:  service.Image,
+				URI:  service.Image,
 			},
 			Config: host.ContainerConfig{
 				Entrypoint: service.Entrypoint,

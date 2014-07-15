@@ -19,6 +19,7 @@ import (
 
 	"github.com/alexzorin/libvirt-go"
 	"github.com/dotcloud/docker/daemon/networkdriver/ipallocator"
+	"github.com/dotcloud/docker/pkg/term"
 	"github.com/flynn/flynn-host/containerinit"
 	lt "github.com/flynn/flynn-host/libvirt"
 	"github.com/flynn/flynn-host/logbuf"
@@ -129,7 +130,7 @@ func readDockerImageConfig(id string) (*dockerImageConfig, error) {
 
 func (l *LibvirtLXCBackend) Run(job *host.Job) (err error) {
 	g := grohl.NewContext(grohl.Data{"backend": "libvirt-lxc", "fn": "run", "job.id": job.ID})
-	g.Log(grohl.Data{"at": "start", "job.artifact.url": job.Artifact.URL, "job.cmd": job.Config.Cmd})
+	g.Log(grohl.Data{"at": "start", "job.artifact.url": job.Artifact.URI, "job.cmd": job.Config.Cmd})
 
 	ip, err := ipallocator.RequestIP(defaultNet, nil)
 	if err != nil {
@@ -149,12 +150,12 @@ func (l *LibvirtLXCBackend) Run(job *host.Job) (err error) {
 	}()
 
 	g.Log(grohl.Data{"at": "pull_image"})
-	layers, err := pinkerton.Pull(job.Artifact.URL)
+	layers, err := pinkerton.Pull(job.Artifact.URI)
 	if err != nil {
 		g.Log(grohl.Data{"at": "pull_image", "status": "error", "err": err})
 		return err
 	}
-	imageID, err := pinkerton.ImageID(job.Artifact.URL)
+	imageID, err := pinkerton.ImageID(job.Artifact.URI)
 	if err == pinkerton.ErrNoImageID && len(layers) > 0 {
 		imageID = layers[len(layers)-1].ID
 	} else if err != nil {
@@ -216,7 +217,18 @@ func (l *LibvirtLXCBackend) Run(job *host.Job) (err error) {
 	}
 
 	g.Log(grohl.Data{"at": "write_env"})
-	if err := writeContainerEnv(filepath.Join(rootPath, ".containerenv"), job.Config.Env, map[string]string{"HOSTNAME": job.ID}); err != nil {
+	err = writeContainerEnv(filepath.Join(rootPath, ".containerenv"),
+		map[string]string{
+			"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"TERM": "xterm",
+			"HOME": "/",
+		},
+		job.Config.Env,
+		map[string]string{
+			"HOSTNAME": job.ID,
+		},
+	)
+	if err != nil {
 		g.Log(grohl.Data{"at": "write_env", "status": "error", "err": err})
 		return err
 	}
@@ -498,28 +510,46 @@ func (l *LibvirtLXCBackend) Attach(req *AttachRequest) error {
 	if client == nil {
 		return fmt.Errorf("missing job client (is the job running?)")
 	}
-	var stdoutDone chan struct{}
-	if stdin {
-		stdin, err := client.GetStdin()
+	var stdinDone chan struct{}
+	if req.Job.Job.Config.TTY {
+		pty, err := client.GetPtyMaster()
 		if err != nil {
 			return err
 		}
-		stdoutDone = make(chan struct{})
-		go func() {
-			io.Copy(stdin, req)
-			stdin.Close()
-			close(stdoutDone)
-		}()
-	}
-	if req.Job.Job.Config.TTY && (stdout || stderr) {
-		stdout, _, err := client.GetStdout()
-		if err != nil {
+		if err := term.SetWinsize(pty.Fd(), &term.Winsize{Height: uint16(req.Height), Width: uint16(req.Width)}); err != nil {
 			return err
 		}
-		io.Copy(req, stdout)
-		stdout.Close()
-		<-stdoutDone
+		if req.Attached != nil {
+			req.Attached <- struct{}{}
+			<-req.Attached
+		}
+		if stdin {
+			stdinDone = make(chan struct{})
+			go func() {
+				io.Copy(pty, req)
+				close(stdinDone)
+			}()
+		}
+		if stdout {
+			io.Copy(req, pty)
+		}
+		if stdinDone != nil {
+			<-stdinDone
+		}
+		pty.Close()
 		return nil
+	}
+	if stdin {
+		stdinPipe, err := client.GetStdin()
+		if err != nil {
+			return err
+		}
+		stdinDone = make(chan struct{})
+		go func() {
+			io.Copy(stdinPipe, req)
+			stdinPipe.Close()
+			close(stdinDone)
+		}()
 	}
 
 	log := l.openLog(req.Job.Job.ID)
@@ -532,7 +562,8 @@ func (l *LibvirtLXCBackend) Attach(req *AttachRequest) error {
 	}
 
 	if req.Attached != nil {
-		close(req.Attached)
+		req.Attached <- struct{}{}
+		<-req.Attached
 	}
 
 	var header [8]byte
@@ -560,7 +591,7 @@ func (l *LibvirtLXCBackend) Attach(req *AttachRequest) error {
 			return err
 		}
 	}
-	<-stdoutDone
+	<-stdinDone
 	return nil
 }
 
